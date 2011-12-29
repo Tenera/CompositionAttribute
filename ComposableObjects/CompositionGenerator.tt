@@ -1,0 +1,221 @@
+﻿<#@ template language="C#" debug="true" hostspecific="True" #>
+<#@ output extension=".cs" #>
+
+<#@ assembly name="System.Core.dll" #>
+<#@ assembly name="C:\Projects\CompositionTestApp\Attributes\bin\Debug\Attributes.dll" #>
+<#@ assembly name="C:\Projects\CompositionTestApp\ComposableObjects\bin\Debug\ComposableObjects.dll" #>
+
+<#@ import namespace="System" #>
+<#@ import namespace="System.Reflection" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="Attributes" #>
+
+using System;
+
+<#
+
+	var assembly = Assembly.GetAssembly(typeof(ComposableObjects.ClassA));
+    var currentNamespace = string.Empty;
+    var nameSpaceMustBeClosed = false;
+
+    foreach (var type in assembly.GetTypes().OrderBy(x => x.Namespace))
+    {
+        var members = type.GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+            .Where(member => member.GetCustomAttributes(typeof(CompositionFieldAttribute), true).Length > 0)
+            .ToArray();
+
+        if (members.Length <= 0) continue;
+
+        if (type.Namespace != currentNamespace)
+        {
+            if (nameSpaceMustBeClosed)
+            {
+                WriteLine("}\n");
+            }
+            WriteLine("namespace " + type.Namespace);
+            WriteLine("{");
+            nameSpaceMustBeClosed = true;
+        }
+
+        ProcessType(type, members);
+    }
+
+    if (nameSpaceMustBeClosed)
+    {
+        WriteLine("}\n");
+    } 
+	
+#>
+
+<#+ 
+	
+		
+	void ProcessType(Type type, IEnumerable<FieldInfo> members)
+    {
+        WriteLine(string.Format("\t{0} partial class {1}",
+                                            type.IsPublic ? "public " : "private", type.Name));
+        WriteLine("\t{");
+        foreach (var member in members)
+        {
+            ProcessMember(member);
+        }
+        WriteLine("\t}\n");
+    }
+
+    void ProcessMember(FieldInfo member)
+    {
+        var attributes = member.GetCustomAttributes(typeof(CompositionFieldAttribute), true);
+        foreach (var att in attributes.OfType<CompositionFieldAttribute>())
+        {
+			WriteEvents(member, att.MappedEvents);
+            WriteProperties(member, att.MappedProperties);
+            WriteMethods(member, att.MappedMethods);
+        }
+    }
+
+	void WriteEvents(FieldInfo field, ICollection<string> events)
+    {
+        if (events == null || events.Count == 0) return;
+
+		var attachEvents = new List<string>();
+        var memberName = field.Name;
+
+        var eventList = field.FieldType
+            .GetEvents()
+            .Where(x => events.Contains(x.Name))
+            .ToList();
+        if (eventList.Count <= 0) return;
+
+        foreach (var ev in eventList)
+        {
+            WriteEvent(memberName, ev);
+            attachEvents.Add(string.Format("{0}.{1} += Handle{0}{1};", memberName, ev.Name));
+        }
+        WriteLine("\t\tprivate void AttachEvents()");
+        WriteLine("\t\t{");
+        foreach (var attachEvent in attachEvents)
+        {
+            WriteLine("\t\t\t" + attachEvent);
+        }
+        WriteLine("\t\t}\n");
+		
+        WriteLine("\t\tprivate void DetachEvents()");
+        WriteLine("\t\t{");
+        foreach (var attachEvent in attachEvents)
+        {
+            WriteLine("\t\t\t" + attachEvent.Replace("+=", "-="));
+        }
+        WriteLine("\t\t}\n");
+    }
+
+    void WriteEvent(string memberName, EventInfo eventInfo)
+    {
+        var eht = eventInfo.EventHandlerType;
+
+        var eventArgs = "EventArgs";
+        var genericArguments = string.Empty;
+        if (eht.IsGenericType)
+        {
+            var genArgs = eht.GetGenericArguments();
+            genericArguments = "<" + string.Join(", ", genArgs.Select(x => x.FullName)) + ">";
+            if (genArgs.Length > 0) eventArgs = genArgs[0].FullName;
+        }
+        WriteLine("\t\tpublic event {0}{1} {2};\n", eventInfo.EventHandlerType.Name.Replace("`1", string.Empty), genericArguments, eventInfo.Name);
+        WriteLine("\t\tprivate void Raise{0}({1} ea)", eventInfo.Name, eventArgs);
+        WriteLine("\t\t{");
+        WriteLine("\t\t\tvar ev = {0};", eventInfo.Name);
+        WriteLine("\t\t\tif (ev != null) { ev(this, ea); }");
+        WriteLine("\t\t}\n");
+        WriteLine("\t\tprivate void Handle{0}{1}(object sender, {2} ea) {{ Raise{1}(ea); }}\n", memberName, eventInfo.Name, eventArgs);
+    }
+	
+    void WriteProperties(FieldInfo field, ICollection<string> properties)
+    {
+        if (properties == null || properties.Count == 0) return;
+        
+        var memberName = field.Name;
+
+        field.FieldType
+            .GetProperties()
+            .Where(x => properties.Contains(x.Name))
+            .ToList()
+            .ForEach(x => WriteProperty(memberName, x));
+    }
+
+    void WriteProperty(string memberName, PropertyInfo propInfo)
+    {
+        WriteLine("\t\tpublic {0} {1}", GetCSharpTypeName(propInfo.PropertyType), propInfo.Name);
+        WriteLine("\t\t{");
+        var accessors = propInfo.GetAccessors();
+        if (accessors.Count(x => x.Name.StartsWith("get_")) > 0)
+        {
+            WriteLine("\t\t\tget {{ return {0}.{1}; }}", memberName, propInfo.Name);
+        }
+        if (accessors.Count(x => x.Name.StartsWith("set_")) > 0)
+        {
+            WriteLine("\t\t\tset {{ {0}.{1} = value; }}", memberName, propInfo.Name);
+        }
+        WriteLine("\t\t}\n");
+    }
+
+    void WriteMethods(FieldInfo field, ICollection<string> methods)
+    {
+        if (methods == null || methods.Count == 0) return;
+        var memberName = field.Name;
+        field.FieldType
+            .GetMethods()
+            .Where(x => methods.Contains(x.Name))
+            .ToList()
+            .ForEach(x => WriteMethod(memberName, x));
+    }
+
+    void WriteMethod(string memberName, MethodInfo method)
+    {
+        var prms = method.GetParameters();
+
+        var genericArguments = string.Empty;
+        if (method.IsGenericMethodDefinition)
+        {
+            var genprm = method.GetGenericArguments();
+            genericArguments = "<" + string.Join(", ", genprm.Select(x => x.Name)) + ">";
+        }
+
+        WriteLine("\t\tpublic {0} {1}{2}({3})",
+            GetCSharpTypeName(method.ReturnType),
+            method.Name,
+            genericArguments,
+            string.Join(", ", prms.Select(x => GetCSharpTypeName(x.ParameterType) + " " + x.Name)));
+        WriteLine("\t\t{");
+        WriteLine("\t\t\t{0}{1}.{2}({3});",
+                          method.ReturnType == typeof(void) ? string.Empty : "return ",
+                          memberName,
+                          method.Name,
+                          string.Join(", ", prms.Select(x => x.Name)));
+        WriteLine("\t\t}\n");
+    }
+	
+	string GetCSharpTypeName(Type type)
+    {
+	    switch(type.Name)
+	    {
+		    case "Boolean":  return "bool";
+		    case "Byte":     return "byte";
+		    case "Char":     return "char";
+		    case "DateTime": return "DateTime";
+		    case "Decimal":  return "decimal";
+		    case "Double":   return "double";
+		    case "Void": 	 return "void";
+		    case "Int16":    return "short";
+		    case "Int32":    return "int";
+		    case "Int64":    return "long";
+		    case "SByte":    return "sbyte";
+		    case "Single":   return "float";
+		    case "String":   return "string";
+		    case "UInt16":   return "ushort";
+		    case "UInt32":   return "uint";
+		    case "UInt64":   return "ulong";
+		    default:         return type.Name;
+	    }
+	}
+	#>
